@@ -23,7 +23,9 @@ CAR = """\
  ▀█████▀                                ▀█████▀"""
 SPEED_LINES = {3: " ══ ═══ ", 4: "  ═ ══  "}
 WALL_INDENT = 34
-TAGLINES = ["", "", "  RACE REPLAY", "  OPENF1 · 2023+", "", ""]
+TAGLINES = [("tag", ""), ("tag", "  RACE REPLAY"), ("tag", "  OPENF1 · 2023+"), ("tag", ""), ("author", "  by Sensey"), ("tag", "")]
+HINT = "↑↓ move · Enter select · Ctrl+C quit"
+BACK, EXIT = "back", "exit"
 BANNER_STYLE = Style.from_dict({
     "flag": "#e6ecff",
     "pit": "#e10600 bold",
@@ -31,6 +33,9 @@ BANNER_STYLE = Style.from_dict({
     "speed": "#00e68c",
     "wall": "#e6ecff bold",
     "tag": "#a0acd2 italic",
+    "author": "#00e68c bold italic",
+    "hint": "#a0acd2",
+    "warn": "#ffd200",
 })
 MENU_STYLE = questionary.Style([
     ("qmark", "fg:#e10600 bold"),
@@ -58,33 +63,66 @@ def print_banner() -> None:
     for i, (p, c) in enumerate(zip(pit, car)):
         fragments += [("class:pit", p.ljust(pit_w)), ("class:speed", SPEED_LINES.get(i, " " * 8)), ("class:car", c + "\n")]
     fragments.append(("", "\n"))
-    for w, tag in zip(wall, TAGLINES):
-        fragments += [("class:wall", " " * WALL_INDENT + w), ("class:tag", tag + "\n")]
-    fragments.append(flag)
+    for w, (tag_style, tag) in zip(wall, TAGLINES):
+        fragments += [("class:wall", " " * WALL_INDENT + w), (f"class:{tag_style}", tag + "\n")]
+    fragments += [flag, ("class:hint", "  Pick a season, a Grand Prix and a session. Back returns one step, Exit or Ctrl+C quits.\n")]
     print_formatted_text(FormattedText(fragments), style=BANNER_STYLE)
 
 
-def _select(question: str, choices: list) -> object:
-    return questionary.select(question, choices=choices, qmark="▶", style=MENU_STYLE).unsafe_ask()
+def _warn(message: str) -> None:
+    print_formatted_text(FormattedText([("class:warn", f"  ! {message}")]), style=BANNER_STYLE)
 
 
-def pick_session() -> tuple[int, str]:
-    """Ask season, Grand Prix and race or sprint, return (session_key, title). Ctrl+C raises KeyboardInterrupt."""
-    # Here I list seasons newest first, OpenF1 starts in 2023
+def _select(question: str, choices: list, first_step: bool) -> object:
+    """Arrow key menu ending with Back (one step up), or Exit on the first step."""
+    last = questionary.Choice("✕  Exit", value=EXIT) if first_step else questionary.Choice("←  Back", value=BACK)
+    return questionary.select(
+        question, choices=[*choices, questionary.Separator(), last], qmark="▶", style=MENU_STYLE, instruction=HINT
+    ).unsafe_ask()
+
+
+def _choices(names: pd.Series, keys: pd.Series) -> list[questionary.Choice]:
+    return [questionary.Choice(name, value=(int(key), name)) for name, key in zip(names, keys)]
+
+
+def pick_session() -> tuple[int, str] | None:
+    """Ask season, Grand Prix and race or sprint, return (session_key, title), None on Exit.
+
+    Back returns to the previous step. Ctrl+C raises KeyboardInterrupt.
+    """
+    # Here I walk the three steps as a small state machine, Back moves one step up, no recursion
     seasons = [str(y) for y in range(pd.Timestamp.now(tz="UTC").year, FIRST_SEASON - 1, -1)]
-    year = int(_select("Season", seasons))
-    events = get_events(year)
-    meeting_key, meeting_name = _select(
-        "Grand Prix",
-        [questionary.Choice(name, value=(key, name)) for name, key in zip(events["meeting_name"], events["meeting_key"])],
-    )
-    # Then I keep sessions a replay makes sense for, race and sprint have positions and intervals
-    sessions = get_sessions(int(meeting_key))
-    sessions = sessions[sessions["session_name"].isin(REPLAY_SESSIONS)]
-    if sessions.empty:
-        raise DataError("No race or sprint session for this Grand Prix yet")
-    session_key, session_name = _select(
-        "Session",
-        [questionary.Choice(name, value=(key, name)) for name, key in zip(sessions["session_name"], sessions["session_key"])],
-    )
-    return int(session_key), f"{year} {meeting_name} {session_name}"
+    step, year, meeting = 0, 0, (0, "")
+    events = sessions = pd.DataFrame()
+    while True:
+        if step == 0:
+            answer = _select("Season", seasons, first_step=True)
+            if answer == EXIT:
+                return None
+            year = int(answer)
+            try:
+                events = get_events(year)
+            except DataError as exc:
+                _warn(str(exc))
+                continue
+            step = 1
+        elif step == 1:
+            answer = _select(f"Grand Prix  {year}", _choices(events["meeting_name"], events["meeting_key"]), first_step=False)
+            if answer == BACK:
+                step = 0
+                continue
+            meeting = answer
+            # Then I keep sessions a replay makes sense for, race and sprint have positions and intervals
+            sessions = get_sessions(meeting[0])
+            sessions = sessions[sessions["session_name"].isin(REPLAY_SESSIONS)]
+            if sessions.empty:
+                _warn("No race or sprint session for this Grand Prix yet")
+                continue
+            step = 2
+        else:
+            answer = _select(f"Session  {meeting[1]}", _choices(sessions["session_name"], sessions["session_key"]), first_step=False)
+            if answer == BACK:
+                step = 1
+                continue
+            session_key, session_name = answer
+            return session_key, f"{year} {meeting[1]} {session_name}"

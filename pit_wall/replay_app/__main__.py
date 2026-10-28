@@ -15,7 +15,10 @@ def main() -> int:
     """Menu, then load the race and open the replay window. Exit code 1 on data errors."""
     try:
         print_banner()
-        session_key, title = pick_session()
+        picked = pick_session()
+        if picked is None:
+            return 0
+        session_key, title = picked
         # Here the first load of a race can take a couple of minutes (OpenF1 rate limit), then it comes from the cache
         print("Loading replay, first load of a race can take ~2 min...")
         scene = Scene(build_replay(session_key), title)

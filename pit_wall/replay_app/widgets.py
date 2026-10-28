@@ -13,7 +13,11 @@ TRACK_EDGE = Color(30, 36, 64)
 PIT_BADGE = Color(40, 110, 230)
 DRS_BADGE = Color(0, 200, 90)
 MAX_ROW_H = 28
-CARD_H = 180
+CARD_H = 150
+# Row centres of a driver card as shares of its inner height: speed, gear, lap and tyre, gaps
+CARD_ROWS = [0.18, 0.42, 0.64, 0.88]
+# Liberation Sans cap height in px per font point (0.73 em at 96 dpi)
+CAP_HEIGHT = 0.73 * 96 / 72
 STATUS_LABELS = {"GREEN": "TRACK CLEAR", "SC": "SAFETY CAR", "VSC": "VIRTUAL SC", "RED": "RED FLAG"}
 LEGEND = [
     ("YELLOW", t.TRACK_STATUS_COLOURS["YELLOW"]),
@@ -68,7 +72,9 @@ def _tyre_badge(x: float, y: float, compound: str, text: t.TextPool, key: str, r
         return
     arcade.draw_circle_filled(x, y, radius, t.TYRE_COLOURS.get(compound, t.DIM))
     arcade.draw_circle_outline(x, y, radius, t.BG, 2)
-    text.put(key, compound[0], x, y, t.BG, size=round(radius * 1.1), anchor_x="center", anchor_y="center")
+    # Pyglet centres on the full line height, I place the baseline half a cap height under the centre instead
+    size = round(radius * 0.8)
+    text.put(key, compound[0], x, y - CAP_HEIGHT * size / 2, t.BG, size=size, anchor_x="center")
 
 
 def draw_track(scene: Scene, f: float, rect: Rect, text: t.TextPool, selected: list[int]) -> None:
@@ -142,42 +148,44 @@ def draw_driver_card(scene: Scene, frame: int, slot: int, rect: Rect, text: t.Te
     num = {f: v[frame, slot] for f, v in scene.num.items()}
     position = "--" if np.isnan(num["position"]) else f"P{num['position']:.0f}"
     inner = t.draw_panel(rect, f"{position}  {scene.acronyms[slot]}  #{scene.numbers[slot]}", text, scene.colours[slot])
-    left, top = inner.left + 4, inner.top - 4
+    # Here the four rows are spread on the card height, so a smaller window shrinks the card without overlaps
+    left = inner.left + 4
+    rows = [inner.top - inner.height * share for share in CARD_ROWS]
     # A retired car has stale telemetry, I only show when it stopped
     if scene.txt["status"][frame, slot] == "OUT":
-        text.put(f"{key}:speed", "RETIRED", left, top - 30, t.DIM, size=22, font=t.FONT_PIXEL)
-        text.put(f"{key}:gear", f"Stopped on lap {num['lap']:.0f}", left, top - 56, t.DIM, size=12)
+        text.put(f"{key}:speed", "RETIRED", left, rows[0], t.DIM, size=18, anchor_y="center", font=t.FONT_PIXEL)
+        text.put(f"{key}:gear", f"Stopped on lap {num['lap']:.0f}", left, rows[1], t.DIM, size=11, anchor_y="center")
         return
     speed = 0 if np.isnan(num["speed"]) else num["speed"]
-    text.put(f"{key}:speed", f"{speed:.0f}", left, top - 32, t.TEXT, size=30, font=t.FONT_PIXEL)
-    text.put(f"{key}:kmh", "KM/H", left + 98, top - 32, t.DIM, size=11)
+    text.put(f"{key}:speed", f"{speed:.0f}", left, rows[0], t.TEXT, size=22, anchor_y="center", font=t.FONT_PIXEL)
+    text.put(f"{key}:kmh", "KM/H", left + 76, rows[0], t.DIM, size=10, anchor_y="center")
     gear = "N" if np.isnan(num["n_gear"]) or num["n_gear"] == 0 else f"{num['n_gear']:.0f}"
-    text.put(f"{key}:gear", f"GEAR {gear}", left, top - 58, t.TEXT, size=13)
+    text.put(f"{key}:gear", f"GEAR {gear}", left, rows[1], t.TEXT, size=12, anchor_y="center")
     drs_open = num["drs"] == 1
-    drs = LBWH(left + 100, top - 64, 56, 20)
+    drs = LBWH(left + 90, rows[1] - 9, 48, 18)
     arcade.draw_rect_filled(drs, DRS_BADGE if drs_open else t.BAR_OFF)
-    text.put(f"{key}:drs", "DRS", drs.x, drs.y, t.BG if drs_open else t.DIM, size=11, anchor_x="center", anchor_y="center")
-    text.put(f"{key}:lap", f"LAP {num['lap']:.0f}", left, top - 84, t.TEXT, size=13)
+    text.put(f"{key}:drs", "DRS", drs.x, drs.y, t.BG if drs_open else t.DIM, size=10, anchor_x="center", anchor_y="center")
+    text.put(f"{key}:lap", f"LAP {num['lap']:.0f}", left, rows[2], t.TEXT, size=12, anchor_y="center")
     compound = scene.txt["compound"][frame, slot]
-    _tyre_badge(left + 110, top - 79, compound, text, f"{key}:tyrebadge", radius=10)
+    _tyre_badge(left + 100, rows[2], compound, text, f"{key}:tyrebadge")
     if compound and not np.isnan(num["tyre_age"]):
         age = int(num["tyre_age"])
-        text.put(f"{key}:tyre", f"{age} LAP{'' if age == 1 else 'S'}", left + 126, top - 84, t.TEXT, size=12)
-    # Here ahead is my own interval, behind is the interval of the car one place back
+        text.put(f"{key}:tyre", f"{age} LAP{'' if age == 1 else 'S'}", left + 114, rows[2], t.TEXT, size=11, anchor_y="center")
+    # Here ahead is my own interval, behind is the interval of the car one place back, both on one row
     order = list(scene.order(frame))
     rank = order.index(slot)
     ahead = _gap_label(scene, slot, frame, to_leader=False)
     behind = _gap_label(scene, int(order[rank + 1]), frame, to_leader=False) if rank + 1 < len(order) else ""
-    text.put(f"{key}:ahead", f"AHEAD   {ahead or '-'}", left, top - 108, t.DIM, size=12)
-    text.put(f"{key}:behind", f"BEHIND  {behind.replace('+', '-') or '-'}", left, top - 128, t.DIM, size=12)
-    bar_h = inner.height - 26
+    gaps = f"AHEAD {ahead or '-'}    BEHIND {behind.replace('+', '-') or '-'}"
+    text.put(f"{key}:gaps", gaps, left, rows[3], t.DIM, size=10, anchor_y="center")
+    bar_h = inner.height - 36
     for i, (label, value, colour) in enumerate([
         ("THR", (0 if np.isnan(num["throttle"]) else num["throttle"]) / 100, t.THROTTLE),
         ("BRK", 0 if np.isnan(num["brake"]) else num["brake"], t.BRAKE),
     ]):
-        x = inner.right - 64 + i * 34
-        t.draw_segment_bar(LBWH(x, inner.bottom + 20, 24, bar_h), value, colour)
-        text.put(f"{key}:{label}", label, x + 12, inner.bottom + 4, t.DIM, size=10, anchor_x="center")
+        x = inner.right - 54 + i * 28
+        t.draw_segment_bar(LBWH(x, inner.bottom + 32, 20, bar_h), value, colour)
+        text.put(f"{key}:{label}", label, x + 10, inner.bottom + 20, t.DIM, size=9, anchor_x="center")
 
 
 def draw_info(scene: Scene, f: float, rect: Rect, text: t.TextPool, speed: float, paused: bool) -> None:
