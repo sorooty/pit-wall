@@ -1,5 +1,6 @@
 """OpenF1 data loading with local HTTP cache."""
 
+import io
 from functools import cache
 from pathlib import Path
 
@@ -23,7 +24,9 @@ LAP_COLUMNS = [
     "i1_speed", "i2_speed", "st_speed", "is_pit_out_lap",
 ]
 SPEED_TRAPS = ["i1_speed", "i2_speed", "st_speed"]
-CAR_COLUMNS = ["date", "speed", "throttle", "brake", "n_gear"]
+CAR_COLUMNS = ["date", "speed", "throttle", "brake", "n_gear", "drs"]
+# OpenF1 DRS codes: 0-9 closed or eligible, 10/12/14 open
+DRS_OPEN_MIN = 10
 
 
 class DataError(ValueError):
@@ -45,13 +48,23 @@ def _get(endpoint: str, **params: str | int | None) -> pd.DataFrame:
     """GET an OpenF1 endpoint as a DataFrame, empty if no results. None params are skipped."""
     # Here I call the API through the cache, OpenF1 answers 404 when a filter matches nothing
     try:
-        resp = _http().get(f"{BASE_URL}/{endpoint}", params=params, timeout=TIMEOUT_S)
+        resp = _http().get(f"{BASE_URL}/{endpoint}", params={**params, "csv": "true"}, timeout=TIMEOUT_S)
         if resp.status_code == 404:
             return pd.DataFrame()
         resp.raise_for_status()
     except requests.RequestException as exc:
         raise DataError(f"OpenF1 {endpoint} request failed: {exc}") from exc
-    return pd.DataFrame(resp.json())
+    # I ask for CSV: half the size of JSON and parsed by pandas' C reader, hex colours stay text
+    return pd.read_csv(io.StringIO(resp.text), dtype={"team_colour": str})
+
+
+def _dated(endpoint: str, **params: str | int | None) -> pd.DataFrame:
+    """Like _get, with the date column parsed to UTC and rows sorted by date."""
+    df = _get(endpoint, **params)
+    if df.empty:
+        return df
+    # Here I parse ISO dates (mixed precision in OpenF1) then sort, merge_asof and interp need ordered time
+    return df.assign(date=pd.to_datetime(df["date"], utc=True, format="ISO8601")).sort_values("date", ignore_index=True)
 
 
 def _started(date_start: pd.Series) -> pd.Series:
@@ -111,19 +124,82 @@ def get_laps(session_key: int, driver_number: int | None = None) -> pd.DataFrame
     return laps.reset_index(drop=True)
 
 
-def get_telemetry(session_key: int, driver_number: int, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    """Car data with interpolated x/y between start and end (UTC): date, speed, throttle, brake 0/1, n_gear, x, y."""
+def get_telemetry(
+    session_key: int, driver_number: int, start: pd.Timestamp | None = None, end: pd.Timestamp | None = None
+) -> pd.DataFrame:
+    """Car data with interpolated x/y, whole session if no window (UTC).
+
+    Columns: date, speed, throttle, brake 0/1, n_gear, drs 0/1 (open), x, y.
+    """
     # Here I fetch car data and positions on the same time window, OpenF1 filters with date> and date<
-    window = {"session_key": session_key, "driver_number": driver_number, "date>": start.isoformat(), "date<": end.isoformat()}
-    car, pos = _get("car_data", **window), _get("location", **window)
+    window = {
+        "session_key": session_key,
+        "driver_number": driver_number,
+        "date>": start.isoformat() if start is not None else None,
+        "date<": end.isoformat() if end is not None else None,
+    }
+    car, pos = _dated("car_data", **window), _dated("location", **window)
     if car.empty or pos.empty:
-        raise DataError(f"No telemetry for driver {driver_number} between {start} and {end}")
-    car = car[CAR_COLUMNS].assign(date=pd.to_datetime(car["date"], utc=True, format="ISO8601")).sort_values("date")
-    pos = pos.assign(date=pd.to_datetime(pos["date"], utc=True, format="ISO8601")).sort_values("date")
+        raise DataError(f"No telemetry for driver {driver_number} in session {session_key}")
+    car = car[CAR_COLUMNS]
     # Then I interpolate x/y at car data timestamps (both ~4 Hz but not aligned), more accurate than nearest match
     car_t, pos_t = car["date"].astype("int64"), pos["date"].astype("int64")
     car["x"] = np.interp(car_t, pos_t, pos["x"])
     car["y"] = np.interp(car_t, pos_t, pos["y"])
-    # OpenF1 brake is 0 or 100, I keep it as an on/off flag
+    # OpenF1 brake is 0 or 100 and DRS uses codes where 10, 12, 14 mean open, I keep both as on/off flags
     car["brake"] = (car["brake"] > 0).astype(int)
-    return car.reset_index(drop=True)
+    car["drs"] = (car["drs"] >= DRS_OPEN_MIN).astype(int)
+    return car
+
+
+def get_positions(session_key: int) -> pd.DataFrame:
+    """Classification changes: date, driver_number, position. One row per change, not per sample."""
+    positions = _dated("position", session_key=session_key)
+    if positions.empty:
+        raise DataError(f"No positions for session {session_key}")
+    return positions[["date", "driver_number", "position"]]
+
+
+def get_intervals(session_key: int) -> pd.DataFrame:
+    """Race gaps every ~4 s: date, driver_number, gap_to_leader (s), interval (s), laps_down."""
+    intervals = _dated("intervals", session_key=session_key)
+    if intervals.empty:
+        raise DataError(f"No intervals for session {session_key} (race and sprint only)")
+    # Here OpenF1 mixes seconds and text like "+1 LAP", I split it into a numeric gap and a laps down count
+    gap = intervals["gap_to_leader"].astype(str)
+    intervals["laps_down"] = pd.to_numeric(gap.str.extract(r"\+(\d+) LAP", expand=False)).fillna(0).astype(int)
+    intervals["gap_to_leader"] = pd.to_numeric(gap, errors="coerce")
+    intervals["interval"] = pd.to_numeric(intervals["interval"], errors="coerce")
+    return intervals[["date", "driver_number", "gap_to_leader", "interval", "laps_down"]]
+
+
+def get_stints(session_key: int) -> pd.DataFrame:
+    """Tyre stints: driver_number, stint_number, lap_start, lap_end, compound, tyre_age_at_start."""
+    stints = _get("stints", session_key=session_key)
+    if stints.empty:
+        raise DataError(f"No stints for session {session_key}")
+    columns = ["driver_number", "stint_number", "lap_start", "lap_end", "compound", "tyre_age_at_start"]
+    return stints[columns].sort_values(["driver_number", "stint_number"], ignore_index=True)
+
+
+def get_pits(session_key: int) -> pd.DataFrame:
+    """Pit stops: date, driver_number, lap_number, lane_duration (s), stop_duration (s). Empty if no stop."""
+    pits = _dated("pit", session_key=session_key)
+    columns = ["date", "driver_number", "lap_number", "lane_duration", "stop_duration"]
+    return pits.reindex(columns=columns)
+
+
+def get_race_control(session_key: int) -> pd.DataFrame:
+    """Race control messages: date, lap_number, category, flag, scope, sector, driver_number, message."""
+    messages = _dated("race_control", session_key=session_key)
+    columns = ["date", "lap_number", "category", "flag", "scope", "sector", "driver_number", "message"]
+    return messages.reindex(columns=columns)
+
+
+def get_weather(session_key: int) -> pd.DataFrame:
+    """Weather every minute: date, air/track temperature (C), humidity (%), wind speed (m/s) and direction, rainfall."""
+    weather = _dated("weather", session_key=session_key)
+    if weather.empty:
+        raise DataError(f"No weather for session {session_key}")
+    columns = ["date", "air_temperature", "track_temperature", "humidity", "wind_speed", "wind_direction", "rainfall"]
+    return weather[columns]

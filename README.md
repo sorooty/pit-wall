@@ -25,9 +25,9 @@ f1_ml_project/            # project root
 ```
 
 ## Setup
-Requires Python 3.11+.
+Requires Python 3.13 (Arcade dependencies have no 3.14 wheels yet).
 ```
-python -m venv .venv
+py -3.13 -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 ```
