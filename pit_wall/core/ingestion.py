@@ -24,6 +24,7 @@ LAP_COLUMNS = [
     "i1_speed", "i2_speed", "st_speed", "is_pit_out_lap",
 ]
 SPEED_TRAPS = ["i1_speed", "i2_speed", "st_speed"]
+UTC_DATE = "datetime64[us, UTC]"
 CAR_COLUMNS = ["date", "speed", "throttle", "brake", "n_gear", "drs"]
 # OpenF1 DRS codes: 0-9 closed or eligible, 10/12/14 open
 DRS_OPEN_MIN = 10
@@ -179,6 +180,8 @@ def get_stints(session_key: int) -> pd.DataFrame:
     if stints.empty:
         raise DataError(f"No stints for session {session_key}")
     columns = ["driver_number", "stint_number", "lap_start", "lap_end", "compound", "tyre_age_at_start"]
+    # Here I drop stints without laps (car out on lap 1), so lap_start is an int lap number like in laps
+    stints = stints.dropna(subset=["lap_start"]).astype({"lap_start": int})
     return stints[columns].sort_values(["driver_number", "stint_number"], ignore_index=True)
 
 
@@ -186,14 +189,15 @@ def get_pits(session_key: int) -> pd.DataFrame:
     """Pit stops: date, driver_number, lap_number, lane_duration (s), stop_duration (s). Empty if no stop."""
     pits = _dated("pit", session_key=session_key)
     columns = ["date", "driver_number", "lap_number", "lane_duration", "stop_duration"]
-    return pits.reindex(columns=columns)
+    # Here I keep typed columns even when empty, so date and duration arithmetic still works downstream
+    return pits.reindex(columns=columns).astype({"date": UTC_DATE, "driver_number": int, "lane_duration": float, "stop_duration": float})
 
 
 def get_race_control(session_key: int) -> pd.DataFrame:
     """Race control messages: date, lap_number, category, flag, scope, sector, driver_number, message."""
     messages = _dated("race_control", session_key=session_key)
     columns = ["date", "lap_number", "category", "flag", "scope", "sector", "driver_number", "message"]
-    return messages.reindex(columns=columns)
+    return messages.reindex(columns=columns).astype({"date": UTC_DATE})
 
 
 def get_weather(session_key: int) -> pd.DataFrame:

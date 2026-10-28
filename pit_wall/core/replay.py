@@ -3,11 +3,44 @@
 import numpy as np
 import pandas as pd
 
-from pit_wall.core.ingestion import DataError, get_telemetry
+from pit_wall.core.ingestion import (
+    DataError,
+    get_drivers,
+    get_intervals,
+    get_laps,
+    get_pits,
+    get_positions,
+    get_race_control,
+    get_stints,
+    get_telemetry,
+    get_weather,
+)
+from pit_wall.core.telemetry import fastest_lap, lap_telemetry
 
 REPLAY_HZ = 4
 FRAME = pd.Timedelta(seconds=1 / REPLAY_HZ)
+# OpenF1 lap starts and start + duration can disagree by a few tenths
+LAP_TOLERANCE = pd.Timedelta(seconds=1)
 CAR_CHANNELS = ["speed", "throttle", "brake", "n_gear", "drs"]
+
+
+def _lap_ends(laps: pd.DataFrame) -> pd.Series:
+    # Here a lap ends at its start plus its duration, NaT when OpenF1 has no time for it
+    return laps["date_start"] + pd.to_timedelta(laps["lap_duration"], unit="s")
+
+
+def chequered_flag(laps: pd.DataFrame) -> pd.Timestamp:
+    """Chequered flag time (UTC): first car completing the last timed lap."""
+    timed = laps[laps["lap_duration"].notna()]
+    if timed.empty:
+        raise DataError("No timed lap in this session")
+    last = timed[timed["lap_number"] == timed["lap_number"].max()]
+    return _lap_ends(last).min()
+
+
+def race_laps(laps: pd.DataFrame) -> pd.DataFrame:
+    """Laps started before the chequered flag, OpenF1 also lists the untimed cool down lap."""
+    return laps[laps["date_start"] < chequered_flag(laps) - LAP_TOLERANCE].reset_index(drop=True)
 
 
 def race_window(laps: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -16,8 +49,7 @@ def race_window(laps: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
     if first.empty:
         raise DataError("No lap 1 in this session, replay needs a race or sprint")
     # Here the end is the latest lap end over all cars, so lapped cars finish their last lap too
-    ends = laps["date_start"] + pd.to_timedelta(laps["lap_duration"], unit="s")
-    return first.min(), ends.max()
+    return first.min(), _lap_ends(laps).max()
 
 
 def _seconds(dates: pd.Series, start: pd.Timestamp) -> np.ndarray:
@@ -52,10 +84,13 @@ def _driver_frames(session_key: int, laps: pd.DataFrame, grid: pd.Series) -> pd.
     return frames
 
 
-def _last_known(frames: pd.DataFrame, events: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    # Here I attach to each frame the latest event value of the same driver, frames must be sorted by date
-    events = events[["date", "driver_number", *columns]].assign(date=events["date"].dt.as_unit(frames["date"].dt.unit))
-    return pd.merge_asof(frames, events, on="date", by="driver_number")
+def _last_known(
+    frames: pd.DataFrame, events: pd.DataFrame, columns: list[str], by: str | None = "driver_number"
+) -> pd.DataFrame:
+    # Here I attach to each frame the latest event value (of the same driver if by), frames must be sorted by date
+    keys = ["date", by] if by else ["date"]
+    events = events[[*keys, *columns]].assign(date=events["date"].dt.as_unit(frames["date"].dt.unit))
+    return pd.merge_asof(frames, events, on="date", by=by)
 
 
 def car_frames(
@@ -95,11 +130,74 @@ def car_frames(
     return frames[columns].sort_values(["frame", "driver_number"], ignore_index=True)
 
 
+def track_status_frames(grid: pd.Series, race_control: pd.DataFrame) -> pd.DataFrame:
+    """Track-wide status at every frame: frame, date, track_status (GREEN, YELLOW, SC, VSC, RED, CHEQUERED)."""
+    frames = pd.DataFrame({"frame": np.arange(len(grid)), "date": grid})
+    if race_control.empty:
+        return frames.assign(track_status="GREEN")
+    # Here I map each message to the status it starts, VSC is tested before SC since its text contains it
+    msg, flag = race_control["message"].fillna("").str.upper(), race_control["flag"]
+    track_wide = race_control["scope"].eq("Track")
+    status = np.select(
+        [
+            msg.str.contains("VIRTUAL SAFETY CAR DEPLOYED"),
+            msg.str.contains("SAFETY CAR DEPLOYED"),
+            msg.str.contains("VIRTUAL SAFETY CAR ENDING"),
+            flag.eq("RED"),
+            flag.eq("CHEQUERED"),
+            track_wide & flag.isin(["YELLOW", "DOUBLE YELLOW"]),
+            track_wide & flag.isin(["GREEN", "CLEAR"]),
+        ],
+        ["VSC", "SC", "GREEN", "RED", "CHEQUERED", "YELLOW", "GREEN"],
+        default="",
+    )
+    events = race_control.loc[status != "", ["date"]].assign(track_status=status[status != ""])
+    # Then each frame keeps the latest status, green before any event
+    frames = _last_known(frames, events, ["track_status"], by=None)
+    frames["track_status"] = frames["track_status"].fillna("GREEN")
+    return frames
+
+
+def weather_frames(grid: pd.Series, weather: pd.DataFrame) -> pd.DataFrame:
+    """Latest weather sample at every frame: frame, date, then get_weather columns."""
+    frames = pd.DataFrame({"frame": np.arange(len(grid)), "date": grid})
+    # Here weather comes every minute, I carry the last sample forward, the first one if the race starts before it
+    columns = [c for c in weather.columns if c != "date"]
+    return _last_known(frames, weather, columns, by=None).bfill()
+
+
+def sector_flags(race_control: pd.DataFrame, race_start: pd.Timestamp, race_end: pd.Timestamp) -> pd.DataFrame:
+    """Marshal sector yellow periods within the race: sector, flag (YELLOW, DOUBLE YELLOW), start, end (UTC)."""
+    columns = ["sector", "flag", "start", "end"]
+    is_sector = race_control["scope"].eq("Sector") & race_control["flag"].isin(["YELLOW", "DOUBLE YELLOW", "CLEAR"])
+    sector = race_control.loc[is_sector, ["date", "sector", "flag"]]
+    if sector.empty:
+        return pd.DataFrame(columns=columns)
+    # Here a sector flag lasts until the next message of the same sector
+    sector["next_sector"] = sector.groupby("sector")["date"].shift(-1)
+    # Or until a track-wide green, clear, red or chequered, which resets every sector
+    resets = race_control.loc[
+        race_control["scope"].eq("Track") & race_control["flag"].isin(["GREEN", "CLEAR", "RED", "CHEQUERED"]), ["date"]
+    ].rename(columns={"date": "reset"})
+    sector = pd.merge_asof(
+        sector, resets, left_on="date", right_on="reset", direction="forward", allow_exact_matches=False
+    )
+    sector["end"] = sector[["next_sector", "reset"]].min(axis=1).fillna(race_end)
+    # Then I keep yellows overlapping the race, clipped to it (pre race and post race messages are dropped)
+    periods = sector[sector["flag"].ne("CLEAR") & (sector["end"] > race_start) & (sector["date"] < race_end)]
+    periods = periods.assign(start=periods["date"].clip(lower=race_start), end=periods["end"].clip(upper=race_end))
+    return periods.astype({"sector": int})[columns].reset_index(drop=True)
+
+
+def track_outline(session_key: int, laps: pd.DataFrame) -> pd.DataFrame:
+    """Track line from the fastest lap of the session: distance (m), x, y. First row is the finish line."""
+    # Here the fastest lap is a clean flying lap, its path starts and ends on the timing line, same x/y as car frames
+    return lap_telemetry(session_key, fastest_lap(laps))[["distance", "x", "y"]]
+
+
 def _car_status(frames: pd.DataFrame, laps: pd.DataFrame) -> np.ndarray:
-    # Here the chequered flag is the first car completing the last lap, cars stopping before it retired
-    last_lap = laps["lap_number"].max()
-    winner = laps[laps["lap_number"] == last_lap]
-    chequered = (winner["date_start"] + pd.to_timedelta(winner["lap_duration"], unit="s")).min()
+    # Here cars that stopped racing after the chequered flag finished, the others retired
+    chequered = chequered_flag(laps)
     done = frames["date"] > frames["finished_at"]
     in_pit = frames["date"] <= frames["pit_exit"]
     return np.select(
@@ -107,3 +205,27 @@ def _car_status(frames: pd.DataFrame, laps: pd.DataFrame) -> np.ndarray:
         ["FIN", "OUT", "PIT"],
         default="RUN",
     )
+
+
+def build_replay(session_key: int) -> dict[str, pd.DataFrame]:
+    """Everything a replay UI draws for a race or sprint, frames at REPLAY_HZ.
+
+    Keys: drivers, cars (car_frames), track_status, sector_flags, outline, weather.
+    """
+    # Here I load the race once, then build every layer on the same clock so UIs only index by frame
+    laps = race_laps(get_laps(session_key))
+    start, end = race_window(laps)
+    grid = _grid(start, end)
+    race_control = get_race_control(session_key)
+    cars = car_frames(
+        session_key, laps, grid, get_positions(session_key), get_intervals(session_key),
+        get_stints(session_key), get_pits(session_key),
+    )
+    return {
+        "drivers": get_drivers(session_key),
+        "cars": cars,
+        "track_status": track_status_frames(grid, race_control),
+        "sector_flags": sector_flags(race_control, start, end),
+        "outline": track_outline(session_key, laps),
+        "weather": weather_frames(grid, get_weather(session_key)),
+    }
