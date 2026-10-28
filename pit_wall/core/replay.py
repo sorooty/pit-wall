@@ -1,5 +1,7 @@
 """Race replay frames: every car state on a fixed time grid, plus track status, outline and weather."""
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pandas as pd
 
@@ -21,6 +23,8 @@ REPLAY_HZ = 4
 FRAME = pd.Timedelta(seconds=1 / REPLAY_HZ)
 # OpenF1 lap starts and start + duration can disagree by a few tenths
 LAP_TOLERANCE = pd.Timedelta(seconds=1)
+# Parallel telemetry downloads, each OpenF1 call waits ~2 s so 3 workers stay under its ~3 req/s limit
+OPENF1_WORKERS = 3
 CAR_CHANNELS = ["speed", "throttle", "brake", "n_gear", "drs"]
 
 
@@ -63,10 +67,9 @@ def _grid(start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
     return pd.Series(pd.date_range(start, end + FRAME, freq=FRAME, unit="us"), name="date")
 
 
-def _driver_frames(session_key: int, laps: pd.DataFrame, grid: pd.Series) -> pd.DataFrame:
+def _driver_frames(laps: pd.DataFrame, tel: pd.DataFrame, grid: pd.Series) -> pd.DataFrame:
     """One driver on the grid: date, driver_number, x, y, car channels, lap, finished_at (end of last lap)."""
     driver_number = int(laps["driver_number"].iloc[0])
-    tel = get_telemetry(session_key, driver_number)
     start = grid.iloc[0]
     t_grid, t_tel = _seconds(grid, start), _seconds(tel["date"], start)
     # Here I interpolate the position so cars move smoothly, then take the nearest sample for discrete channels (gear, DRS)
@@ -80,7 +83,10 @@ def _driver_frames(session_key: int, laps: pd.DataFrame, grid: pd.Series) -> pd.
     frames["lap"] = np.where(idx >= 0, laps["lap_number"].to_numpy()[np.clip(idx, 0, None)], 0)
     # The last lap end tells when the car stopped racing (finish or retirement)
     last = laps.iloc[-1]
-    frames["finished_at"] = last["date_start"] + pd.Timedelta(seconds=np.nan_to_num(last["lap_duration"]))
+    lap_end = last["date_start"] + pd.Timedelta(seconds=np.nan_to_num(last["lap_duration"]))
+    # Capped by its last movement, OpenF1 sometimes dates the lap of a crashed car at the end of the race
+    moving = tel.loc[tel["speed"] > 0, "date"]
+    frames["finished_at"] = min(lap_end, moving.max()) if not moving.empty else lap_end
     return frames
 
 
@@ -107,8 +113,11 @@ def car_frames(
     Columns: frame, date, driver_number, x, y, speed, throttle, brake, n_gear, drs, lap, position,
     gap_to_leader, interval, laps_down, compound, tyre_age, status (RUN, PIT, OUT retired, FIN finished).
     """
-    # Here I build each driver on the shared clock (loop over ~20 drivers, each one vectorized)
-    frames = pd.concat([_driver_frames(session_key, drv_laps, grid) for _, drv_laps in laps.groupby("driver_number")])
+    # Here I download every driver telemetry in parallel, then build each one on the shared clock (vectorized per driver)
+    groups = [drv_laps for _, drv_laps in laps.groupby("driver_number")]
+    with ThreadPoolExecutor(max_workers=OPENF1_WORKERS) as pool:
+        tels = list(pool.map(lambda g: get_telemetry(session_key, int(g["driver_number"].iloc[0])), groups))
+    frames = pd.concat([_driver_frames(drv_laps, tel, grid) for drv_laps, tel in zip(groups, tels)])
     frames = frames.sort_values(["date", "driver_number"], ignore_index=True)
     frames = _last_known(frames, positions, ["position"])
     frames = _last_known(frames, intervals, ["gap_to_leader", "interval", "laps_down"])
@@ -207,10 +216,17 @@ def _car_status(frames: pd.DataFrame, laps: pd.DataFrame) -> np.ndarray:
     )
 
 
+def leader_laps(cars: pd.DataFrame) -> pd.DataFrame:
+    """First frame of each lap of the race leader: frame, lap. Lap marks for timelines."""
+    # Here cars is sorted by frame, so the first leader row of each lap is where that lap starts
+    lead = cars[(cars["position"] == 1) & (cars["lap"] > 0)]
+    return lead.drop_duplicates("lap")[["frame", "lap"]].reset_index(drop=True)
+
+
 def build_replay(session_key: int) -> dict[str, pd.DataFrame]:
     """Everything a replay UI draws for a race or sprint, frames at REPLAY_HZ.
 
-    Keys: drivers, cars (car_frames), track_status, sector_flags, outline, weather.
+    Keys: drivers, cars (car_frames), leader_laps, track_status, sector_flags, outline, weather.
     """
     # Here I load the race once, then build every layer on the same clock so UIs only index by frame
     laps = race_laps(get_laps(session_key))
@@ -224,6 +240,7 @@ def build_replay(session_key: int) -> dict[str, pd.DataFrame]:
     return {
         "drivers": get_drivers(session_key),
         "cars": cars,
+        "leader_laps": leader_laps(cars),
         "track_status": track_status_frames(grid, race_control),
         "sector_flags": sector_flags(race_control, start, end),
         "outline": track_outline(session_key, laps),

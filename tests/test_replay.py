@@ -8,6 +8,7 @@ from pit_wall.core.replay import (
     FRAME,
     _grid,
     chequered_flag,
+    leader_laps,
     race_laps,
     race_window,
     sector_flags,
@@ -93,3 +94,15 @@ def test_weather_carries_last_sample_and_fills_before_first() -> None:
     frames = weather_frames(_grid(T0, T0 + pd.Timedelta(seconds=4)), weather).set_index("frame")["air_temperature"]
     hz = round(pd.Timedelta(seconds=1) / FRAME)
     assert [frames[0], frames[2 * hz], frames[4 * hz]] == [20.0, 20.0, 21.0]
+
+
+def test_leader_laps_first_frame_of_each_leader_lap() -> None:
+    # Here car 2 leads lap 1, car 1 takes the lead on lap 2, lap 0 frames before the start are ignored
+    cars = pd.DataFrame({
+        "frame": [0, 0, 1, 1, 2, 2, 3, 3],
+        "driver_number": [1, 2] * 4,
+        "lap": [0, 0, 1, 1, 1, 2, 2, 2],
+        "position": [2, 1, 2, 1, 2, 1, 1, 2],
+    })
+    marks = leader_laps(cars)
+    assert marks.to_dict("list") == {"frame": [1, 2], "lap": [1, 2]}
