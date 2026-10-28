@@ -1,2 +1,6 @@
 projet/
 /CLAUDE.md
+.venv/
+cache/
+__pycache__/
+.pytest_cache/
