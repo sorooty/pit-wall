@@ -32,6 +32,7 @@ I am also a machine learning student, passionate about AI and software. I wanted
 - [Project structure](#project-structure)
 - [Data notes](#data-notes)
 - [What the replay does not tell you](#what-the-replay-does-not-tell-you)
+- [Next: tyre and strategy predictions (WIP)](#next-tyre-and-strategy-predictions--wip)
 
 ---
 
@@ -110,6 +111,8 @@ The whole race on one bar. Coloured blocks are safety car, virtual safety car an
 | `G` | Interval or gap to leader |
 | Click | Leaderboard row: driver card. Timeline: seek |
 | `ESC` | Quit |
+
+The same actions are on the playback bar under the track map: restart, seek back, play or pause, seek forward, and speed down or up.
 
 ---
 
@@ -233,6 +236,29 @@ Watch Jeddah 2024 again and stop on lap 7. The safety car comes out, half the fi
 The replay shows *what* happened, frame by frame. It does not yet say *why*: how fast those mediums were falling apart, what the stop really cost, what staying out two more laps would have changed.
 
 Those are exactly the questions that started this project. The pit wall is now in place, with every frame of every race on one clock, ready for the answers.
+
+---
+
+## Next: tyre and strategy predictions `🚧 WIP`
+
+The machine learning part of the project, in four steps.
+
+| Step | What | How |
+|---|---|---|
+| **1. Lap dataset** | One row per driver and per lap, every race since 2023 | Compound, tyre age, stint, laps remaining, track temperature, gap ahead. Laps 1, in and out laps, SC/VSC laps and traffic are removed. |
+| **2. Tyre degradation** | How much time a tyre loses lap after lap | `lap time = base pace + fuel effect + tyre wear + noise`. Fuel is corrected first (about 0.03 s per kg, 0.05 to 0.06 s per lap). Linear regression per stint as baseline, then a shared model, then **XGBoost** only if it clearly beats it. |
+| **3. Strategy simulator** | Which strategy wins, and how often | Monte Carlo over the end of the race, thousands of runs: degradation model, pit lane loss per circuit, safety car probability, overtaking difficulty. |
+| **4. Predictions in the replay** | The answers, on the same screen | Pause at any lap, the simulator restarts from that state without knowing the future. |
+
+Validation is done on **whole races never seen in training** (`GroupKFold` by race, MAE in seconds per lap): mixing laps of the same race between train and test gives a falsely good score.
+
+In the replay, predictions will arrive as an optional overlay keyed by `(frame, driver)`, exactly like the cars, so the window keeps drawing without computing anything:
+
+- **Leaderboard:** predicted finishing position, win probability
+- **Driver cards:** remaining tyre life, predicted pit lap, a top view tyre HUD (four tyres from green to red, modelled since OpenF1 has no wear data)
+- **Track map:** ghost car, undercut threat
+- **Timeline:** pit windows, safety car risk
+- **Strategy panel:** strategies compared side by side
 
 ---
 
