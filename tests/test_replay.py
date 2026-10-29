@@ -8,6 +8,7 @@ from pit_wall.core.replay import (
     FRAME,
     _grid,
     chequered_flag,
+    final_classification,
     leader_laps,
     race_laps,
     race_window,
@@ -106,3 +107,19 @@ def test_leader_laps_first_frame_of_each_leader_lap() -> None:
     })
     marks = leader_laps(cars)
     assert marks.to_dict("list") == {"frame": [1, 2], "lap": [1, 2]}
+
+
+def test_final_classification_orders_by_laps_then_crossing() -> None:
+    # Here car 1 wins at 200 s, car 2 crosses 1.5 s later, car 3 is a lap down, car 4 retired on lap 1
+    laps = pd.DataFrame({
+        "driver_number": [1, 1, 2, 2, 3, 4],
+        "lap_number": [1, 2, 1, 2, 1, 1],
+        "date_start": _at([0, 100, 0.5, 101, 1, 1]),
+        "lap_duration": [100, 100, 100, 100.5, 205, 50],
+    })
+    final = final_classification(laps)
+    assert final["driver_number"].tolist() == [1, 2, 3]
+    assert final["gap_to_leader"].iloc[1] == 1.5
+    assert final["interval"].iloc[1] == 1.5
+    assert final["laps_down"].tolist() == [0, 0, 1]
+    assert np.isnan(final["gap_to_leader"].iloc[2])

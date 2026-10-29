@@ -47,6 +47,28 @@ def race_laps(laps: pd.DataFrame) -> pd.DataFrame:
     return laps[laps["date_start"] < chequered_flag(laps) - LAP_TOLERANCE].reset_index(drop=True)
 
 
+def final_classification(laps: pd.DataFrame) -> pd.DataFrame:
+    """Cars taking the flag, from lap times: driver_number, position, gap_to_leader (s), interval (s), laps_down.
+
+    Gaps are NaN for lapped cars, laps_down says how far behind they are.
+    """
+    ends = laps.assign(end=_lap_ends(laps)).dropna(subset=["end"])
+    last = ends.sort_values("end").groupby("driver_number").tail(1)
+    last = last[last["end"] >= chequered_flag(laps) - LAP_TOLERANCE]
+    # Here more laps first, then earlier crossing, like the official order
+    last = last.sort_values(["lap_number", "end"], ascending=[False, True], ignore_index=True)
+    laps_down = last["lap_number"].iloc[0] - last["lap_number"]
+    gap = (last["end"] - last["end"].iloc[0]).dt.total_seconds()
+    on_lead_lap = laps_down == 0
+    return pd.DataFrame({
+        "driver_number": last["driver_number"],
+        "position": np.arange(1, len(last) + 1),
+        "gap_to_leader": gap.where(on_lead_lap),
+        "interval": gap.diff().fillna(0.0).where(on_lead_lap),
+        "laps_down": laps_down,
+    })
+
+
 def race_window(laps: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
     """Race start (lap 1 start) and end (last car crossing the line), UTC."""
     first = laps.loc[laps["lap_number"] == 1, "date_start"]
@@ -131,6 +153,12 @@ def car_frames(
     pit_lane = pits.assign(pit_exit=pits["date"], date=pits["date"] - pd.to_timedelta(pits["lane_duration"], unit="s"))
     frames = _last_known(frames.sort_values("date"), pit_lane.sort_values("date"), ["pit_exit"])
     frames["status"] = _car_status(frames, laps)
+    # Once a car takes the flag I freeze its classification, live intervals keep drifting during the cool down lap
+    finished = frames["status"].eq("FIN")
+    final = final_classification(laps).set_index("driver_number").reindex(frames.loc[finished, "driver_number"])
+    for column in ["position", "gap_to_leader", "interval"]:
+        frames.loc[finished, column] = final[column].to_numpy(dtype=float)
+    frames.loc[finished, "laps_down"] = final["laps_down"].fillna(0).to_numpy(dtype=int)
     frames["frame"] = ((frames["date"] - grid.iloc[0]) / FRAME).round().astype(int)
     columns = [
         "frame", "date", "driver_number", "x", "y", *CAR_CHANNELS, "lap", "position",
