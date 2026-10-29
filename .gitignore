@@ -4,3 +4,4 @@ projet/
 cache/
 __pycache__/
 .pytest_cache/
+pit_wall/replay_app/captures/
