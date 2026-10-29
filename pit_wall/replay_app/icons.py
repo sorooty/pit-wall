@@ -58,3 +58,38 @@ def weather_sky(x: float, y: float, raining: bool) -> None:
     arcade.draw_circle_filled(x + 8, y + 1, 5, CLOUD)
     arcade.draw_rect_filled(LBWH(x - 12, y - 4, 25, 6), CLOUD)
     arcade.draw_line(x - 12, y - 4, x + 13, y - 4, BG, 1)
+
+
+def triangle(x: float, y: float, size: float, colour: Color, left: bool = False) -> None:
+    """Play style triangle centred on (x, y), pointing right or left."""
+    tip = -size if left else size
+    arcade.draw_triangle_filled(x - tip * 0.6, y - size, x - tip * 0.6, y + size, x + tip * 0.6, y, colour)
+
+
+def pause(x: float, y: float, size: float, colour: Color) -> None:
+    """Two vertical bars."""
+    for dx in (-size * 0.55, size * 0.55):
+        arcade.draw_rect_filled(LBWH(x + dx - size * 0.3, y - size, size * 0.6, size * 2), colour)
+
+
+def restart(x: float, y: float, size: float, colour: Color) -> None:
+    """Bar then a left triangle, back to the start."""
+    arcade.draw_rect_filled(LBWH(x - size * 1.1, y - size, size * 0.35, size * 2), colour)
+    triangle(x + size * 0.2, y, size, colour, left=True)
+
+
+def double_triangle(x: float, y: float, size: float, colour: Color, left: bool = False) -> None:
+    """Two triangles side by side, seek back or forward."""
+    for dx in (-size * 0.6, size * 0.6):
+        triangle(x + dx, y, size * 0.85, colour, left=left)
+
+
+def minus(x: float, y: float, size: float, colour: Color) -> None:
+    """Horizontal bar."""
+    arcade.draw_rect_filled(LBWH(x - size, y - size * 0.22, size * 2, size * 0.44), colour)
+
+
+def plus(x: float, y: float, size: float, colour: Color) -> None:
+    """Cross."""
+    minus(x, y, size, colour)
+    arcade.draw_rect_filled(LBWH(x - size * 0.22, y - size, size * 0.44, size * 2), colour)

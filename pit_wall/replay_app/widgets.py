@@ -14,6 +14,7 @@ PIT_BADGE = Color(40, 110, 230)
 DRS_BADGE = Color(0, 200, 90)
 MAX_ROW_H = 28
 CARD_H = 150
+BUTTON_W, BUTTON_H, BUTTON_GAP, GROUP_GAP, SPEED_LABEL_W = 46, 34, 6, 22, 60
 # Row centres of a driver card as shares of its inner height: speed, gear, lap and tyre, gaps
 CARD_ROWS = [0.18, 0.42, 0.64, 0.88]
 # Liberation Sans cap height in px per font point (0.73 em at 96 dpi)
@@ -271,6 +272,45 @@ def draw_controls(rect: Rect, text: t.TextPool) -> None:
         y = inner.top - row_h * (i % rows + 0.5)
         right = t.draw_keycap(x, y, key, text, f"ctl:key:{i}")
         text.put(f"ctl:action:{i}", action, right + 8, y, t.TEXT, size=11, anchor_y="center")
+
+
+def draw_transport(
+    rect: Rect, paused: bool, speed: float, text: t.TextPool, mouse: tuple[float, float]
+) -> list[tuple[Rect, str]]:
+    """Clickable playback bar centred in rect: restart, seek back, play or pause, seek forward, speed down and up.
+
+    Returns button rects with their action for clicks.
+    """
+    buttons = [
+        ("restart", icons.restart),
+        ("back", lambda x, y, s, c: icons.double_triangle(x, y, s, c, left=True)),
+        ("play", icons.triangle if paused else icons.pause),
+        ("forward", icons.double_triangle),
+        ("slower", icons.minus),
+        ("speed", None),
+        ("faster", icons.plus),
+    ]
+    widths = [SPEED_LABEL_W if action == "speed" else BUTTON_W for action, _ in buttons]
+    # Here the speed group sits apart from the transport group
+    total = sum(widths) + BUTTON_GAP * (len(buttons) - 1) + GROUP_GAP
+    x = rect.x - total / 2
+    hits = []
+    for (action, draw_icon), width in zip(buttons, widths):
+        if action == "slower":
+            x += GROUP_GAP
+        button = LBWH(x, rect.y - BUTTON_H / 2, width, BUTTON_H)
+        x += width + BUTTON_GAP
+        if draw_icon is None:
+            label = f"x{speed:g}"
+            text.put("transport:speed", label, button.x, button.y, t.TEXT, size=14, anchor_x="center", anchor_y="center", font=t.FONT_PIXEL)
+            continue
+        hovered = button.point_in_rect(mouse)
+        arcade.draw_rect_filled(button, t.PANEL_LIGHT if hovered else t.KEYCAP)
+        arcade.draw_line(button.left, button.top, button.right, button.top, t.PANEL_LIGHT, 2)
+        arcade.draw_line(button.left, button.bottom, button.right, button.bottom, t.BG, 2)
+        draw_icon(button.x, button.y, 8, t.BG if hovered else t.TEXT)
+        hits.append((button, action))
+    return hits
 
 
 def card_rects(column: Rect, count: int, gap: float = 8) -> list[Rect]:
