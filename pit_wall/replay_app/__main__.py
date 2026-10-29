@@ -6,7 +6,8 @@ import arcade
 
 from pit_wall.core.ingestion import DataError
 from pit_wall.core.replay import build_replay
-from pit_wall.replay_app.menu import pick_session, print_banner
+from pit_wall.replay_app.banner import print_banner
+from pit_wall.replay_app.menu import pick_session
 from pit_wall.replay_app.scene import Scene
 from pit_wall.replay_app.window import ReplayWindow
 
